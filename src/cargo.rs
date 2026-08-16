@@ -26,8 +26,8 @@ pub fn find_package(
     cargo_meta
         .workspace_packages()
         .into_iter()
-        .filter(|p| {
-            let manifest_dir = p.manifest_path.parent().unwrap();
+        .filter(|path| {
+            let manifest_dir = path.manifest_path.parent().unwrap();
 
             working_directory.starts_with(manifest_dir)
         })

@@ -33,6 +33,17 @@ opt-level = "s"
 firmware-file = "nuttx.uf2"
 ```
 
+By default, the tool assumes the entry point for the program is <crate_name>_main, of which the signature should look like this:
+
+```rust
+#[unsafe(no_mangle)]
+unsafe extern "C" fn example_main(_argc: i32, _argv: *const *const u8) -> i32 {
+    println!("Hello, world!");
+
+    0
+}
+```
+
 Invoking the `cargo nuttx build` command will build your project for the specified board and output in a folder called `nuttx` in your target directory.
 
 Note that a nightly compiler _is_ required as this operates off `-Zbuild-std`
