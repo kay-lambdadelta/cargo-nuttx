@@ -33,7 +33,7 @@ opt-level = "s"
 firmware-file = "nuttx.u2f"
 ```
 
-Invoking the `cargo nuttx` command will build your project for the specified board and output in a folder called `nuttx` in your target directory.
+Invoking the `cargo nuttx build` command will build your project for the specified board and output in a folder called `nuttx` in your target directory.
 
 Note that a nightly compiler _is_ required as this operates off `-Zbuild-std`
 
