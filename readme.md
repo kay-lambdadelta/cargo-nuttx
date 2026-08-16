@@ -30,7 +30,7 @@ target-cpu = "cortex-m33"
 # Optional optimization level to use for this board
 opt-level = "s"
 # The name of the firmware file this tool should pull into your target directory
-firmware-file = "nuttx.u2f"
+firmware-file = "nuttx.uf2"
 ```
 
 Invoking the `cargo nuttx build` command will build your project for the specified board and output in a folder called `nuttx` in your target directory.
