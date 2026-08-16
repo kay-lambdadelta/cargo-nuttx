@@ -1,0 +1,29 @@
+name: "build"
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  debian-trixie-x86_64:
+    name: Debian Trixie (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Install Linux dependencies
+        run: |
+          apt update
+          apt install -y --no-install-recommends \
+            rustup \
+            ca-certificates \
+            curl \
+            git \
+            build-essential
+
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: cargo build --all-features
+
+      - name: Test
+        run: cargo test --all-features
