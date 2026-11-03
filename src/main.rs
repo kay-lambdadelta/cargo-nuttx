@@ -1,106 +1,250 @@
-use std::{error::Error, fs};
+use std::{error::Error, fs, process::ExitCode};
 
-use cargo_metadata::MetadataCommand;
-use clap::Parser;
+use camino::Utf8PathBuf;
+use cargo_metadata::{MetadataCommand, Package};
 use convert_case::{Case, Casing};
 
 use crate::{
-    cargo::{find_package, find_potential_cargo_targets},
-    cli::{Cli, Commands},
-    metadata::get_nuttx_metadata,
-    nuttx::build_nuttx,
+    cargo::{CargoInvocation, find_package, run_cargo},
+    cli::{BuildArgs, Cli, Command, CommonArgs},
+    metadata::{BoardSpecificMetadata, Metadata, get_nuttx_metadata},
+    nuttx::{AppConfig, NuttxTree},
+    process::run,
 };
 
 mod cargo;
 mod cli;
 mod metadata;
 mod nuttx;
+mod process;
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let mut args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("nuttx") {
-        args.remove(1);
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    let result = match cli.command {
+        Command::Build(args) => build(&args).map(|_| ()),
+        Command::Run(args) => run_firmware(&args),
+        Command::Check(args) => check("check", &args),
+        Command::Clippy(args) => check("clippy", &args),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
     }
+}
 
-    let cli = Cli::parse_from(args);
-    let cargo_meta = MetadataCommand::new().exec()?;
+struct Project {
+    package: Package,
+    metadata: Metadata,
+    board: String,
+    board_config: String,
+    target_directory: Utf8PathBuf,
+    program_name: String,
+    entrypoint_symbol: String,
+    config_fragments: Vec<String>,
+    tree: NuttxTree,
+}
 
-    match cli.command {
-        Commands::Build {
-            release,
-            nuttx_location,
-            make_args,
-        } => {
-            let package = find_package(cli.package.as_deref(), &cargo_meta)?;
+impl Project {
+    fn load(args: &CommonArgs) -> Result<Self, Box<dyn Error>> {
+        let cargo_meta = MetadataCommand::new().exec()?;
+        let package = find_package(args.package.as_deref(), &cargo_meta)?.clone();
+        let metadata = get_nuttx_metadata(&package)?;
 
-            let metadata = get_nuttx_metadata(&package)?;
-            let board_metadata = metadata
+        if !package.targets.iter().any(|target| target.is_staticlib()) {
+            return Err(format!(
+                "Package {} has no staticlib target; add `crate-type = [\"staticlib\"]` to its \
+                 [lib] section",
+                package.name
+            )
+            .into());
+        }
+
+        let known_boards = || {
+            metadata
                 .boards
-                .get(&cli.board)
-                .ok_or_else(|| format!("No board metadata found for board {}", cli.board))?;
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
 
-            let entrypoint_symbol = metadata
-                .entrypoint_symbol
-                .unwrap_or_else(|| format!("{}_main", package.name.as_str().to_case(Case::Snake)));
-
-            let potential_targets =
-                find_potential_cargo_targets(&package.targets).collect::<Vec<_>>();
-
-            if potential_targets.len() != 1 {
+        let board = match &args.board {
+            Some(board) => board.clone(),
+            None if metadata.boards.len() == 1 => metadata.boards.keys().next().unwrap().clone(),
+            None => {
                 return Err(format!(
-                    "Expected exactly one target, found these: {:?}
-                        Make sure you set the target you want this tool to build as a `staticlib`",
-                    potential_targets
+                    "Pick a board with --board (known boards: {})",
+                    known_boards()
+                )
+                .into());
+            }
+        };
+
+        let board_metadata = metadata.boards.get(&board).ok_or_else(|| {
+            format!(
+                "No [package.metadata.nuttx.boards.{board}] table in package {} (known boards: {})",
+                package.name,
+                known_boards()
+            )
+        })?;
+
+        let board_config = args
+            .board_config
+            .clone()
+            .or_else(|| board_metadata.board_config.clone())
+            .unwrap_or_else(|| "nsh".to_string());
+
+        let snake_case_name = package.name.as_str().to_case(Case::Snake);
+        let program_name = metadata
+            .program_name
+            .clone()
+            .unwrap_or_else(|| snake_case_name.clone());
+        let entrypoint_symbol = metadata
+            .entrypoint_symbol
+            .clone()
+            .unwrap_or_else(|| format!("{snake_case_name}_main"));
+
+        let mut config_fragments = Vec::new();
+
+        if let Some(config_path) = &metadata.config {
+            config_fragments.push(read_config_fragment(config_path)?);
+        }
+
+        if let Some(board_config_directory) = &metadata.board_config_directory {
+            if !board_config_directory.is_dir() {
+                return Err(format!(
+                    "board-config-directory {board_config_directory} does not exist"
                 )
                 .into());
             }
 
-            let build_target = potential_targets[0];
+            let board_config_path = board_config_directory.join(&board);
+            if board_config_path.is_file() {
+                config_fragments.push(read_config_fragment(&board_config_path)?);
+            }
+        }
 
-            let config_fragment = if let Some(config_fragment) = metadata.config {
-                fs::read_to_string(&config_fragment)?
-            } else {
-                "".to_string()
-            };
+        let tree = NuttxTree::locate(
+            args.nuttx.location(metadata.nuttx_version.as_deref()),
+            &package.name,
+            &board,
+        )?;
 
-            let board_config_path = metadata.board_config_directory.join(&cli.board);
-            let board_config_fragment = if board_config_path.is_file() {
-                fs::read_to_string(&board_config_path)?
-            } else {
-                "".to_string()
-            };
+        Ok(Self {
+            package,
+            metadata,
+            board,
+            board_config,
+            target_directory: cargo_meta.target_directory,
+            program_name,
+            entrypoint_symbol,
+            config_fragments,
+            tree,
+        })
+    }
 
-            let nuttx_path = build_nuttx(
-                &package.name,
-                nuttx_location.into(),
-                &cli.board,
-                &cli.board_config,
-                &config_fragment,
-                &board_config_fragment,
-                &build_target.name,
-                &entrypoint_symbol,
-                release,
-                cli.clean,
-                metadata.priority,
-                metadata.stack_size,
-                board_metadata,
-                make_args,
-            )?;
+    fn board_metadata(&self) -> &BoardSpecificMetadata {
+        &self.metadata.boards[&self.board]
+    }
 
-            let firmware_file_path = nuttx_path.join("nuttx").join(&board_metadata.firmware_file);
-            let output_file = cargo_meta
-                .target_directory
-                .join("nuttx")
-                .join(cli.board)
-                .join(if release { "release" } else { "debug" })
-                .join(&board_metadata.firmware_file);
-
-            fs::create_dir_all(output_file.parent().unwrap())?;
-            fs::copy(firmware_file_path, &output_file)?;
-
-            println!("Firmware output to: {}", output_file);
+    fn app_config(&self) -> AppConfig<'_> {
+        AppConfig {
+            crate_name: &self.package.name,
+            program_name: &self.program_name,
+            entrypoint_symbol: &self.entrypoint_symbol,
+            priority: self.metadata.priority,
+            stack_size: self.metadata.stack_size,
+            config_fragments: &self.config_fragments,
         }
     }
+
+    fn configure(&self, clean: bool) -> Result<(), Box<dyn Error>> {
+        self.tree
+            .configure(&self.board, &self.board_config, &self.app_config(), clean)
+    }
+
+    fn cargo(
+        &self,
+        subcommand: &str,
+        args: &CommonArgs,
+    ) -> Result<Option<Utf8PathBuf>, Box<dyn Error>> {
+        run_cargo(&CargoInvocation {
+            subcommand,
+            package: &self.package,
+            release: args.release,
+            jobs: args.jobs,
+            board_metadata: self.board_metadata(),
+            include_directories: &self.tree.include_directories(),
+            extra_args: &args.cargo_args,
+        })
+    }
+}
+
+fn read_config_fragment(path: &Utf8PathBuf) -> Result<String, Box<dyn Error>> {
+    fs::read_to_string(path)
+        .map_err(|error| format!("Could not read NuttX config fragment {path}: {error}").into())
+}
+
+fn build(args: &BuildArgs) -> Result<(Project, Utf8PathBuf), Box<dyn Error>> {
+    let common = &args.common;
+    let project = Project::load(common)?;
+    project.configure(common.clean)?;
+
+    let staticlib_path = project
+        .cargo("build", common)?
+        .ok_or("cargo did not produce a static library")?;
+
+    let app = project.app_config();
+    project
+        .tree
+        .build(&app, &staticlib_path, common.jobs, &args.make_args)?;
+
+    let output_directory = project
+        .target_directory
+        .join("nuttx")
+        .join(&project.board)
+        .join(if common.release { "release" } else { "debug" });
+    fs::create_dir_all(&output_directory)?;
+
+    let firmware_file = &project.board_metadata().firmware_file;
+    for file_name in ["nuttx", firmware_file.as_str()] {
+        let source = project.tree.nuttx.join(file_name);
+        fs::copy(&source, output_directory.join(file_name))
+            .map_err(|error| format!("Could not copy {source}: {error}"))?;
+    }
+
+    let firmware_path = output_directory.join(firmware_file);
+    eprintln!("Firmware written to {firmware_path}");
+
+    Ok((project, firmware_path))
+}
+
+fn run_firmware(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
+    let (project, firmware_path) = build(args)?;
+
+    let Some([program, runner_args @ ..]) = project.board_metadata().runner.as_deref() else {
+        return Err(format!(
+            "No runner configured; set `runner` in [package.metadata.nuttx.boards.{}]",
+            project.board
+        )
+        .into());
+    };
+
+    eprintln!("Running {program} {firmware_path}");
+    run(std::process::Command::new(program)
+        .args(runner_args)
+        .arg(&firmware_path))
+}
+
+fn check(subcommand: &str, args: &CommonArgs) -> Result<(), Box<dyn Error>> {
+    let project = Project::load(args)?;
+    project.configure(args.clean)?;
+    project.cargo(subcommand, args)?;
 
     Ok(())
 }

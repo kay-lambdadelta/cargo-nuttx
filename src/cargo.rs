@@ -1,110 +1,162 @@
 use std::{
+    env,
     error::Error,
     io::BufReader,
+    num::NonZero,
     process::{Command, Stdio},
 };
 
 use camino::Utf8PathBuf;
-use cargo_metadata::{Message, Metadata, Package, Target};
+use cargo_metadata::{Message, Metadata, Package};
 
 use crate::metadata::BoardSpecificMetadata;
 
-pub fn find_package(
+pub fn find_package<'a>(
     explicit_name: Option<&str>,
-    cargo_meta: &Metadata,
-) -> Result<Package, Box<dyn Error>> {
+    cargo_meta: &'a Metadata,
+) -> Result<&'a Package, Box<dyn Error>> {
+    let workspace_packages = cargo_meta.workspace_packages();
+
     if let Some(name) = explicit_name {
-        return cargo_meta
-            .packages
-            .iter()
+        return workspace_packages
+            .into_iter()
             .find(|package| package.name.as_str() == name)
-            .ok_or_else(|| "No such package in workspace: {name}".into())
-            .cloned();
+            .ok_or_else(|| format!("No package named `{name}` in this workspace").into());
     }
 
-    let working_directory = std::env::current_dir()?;
-    cargo_meta
-        .workspace_packages()
+    let nuttx_packages: Vec<_> = workspace_packages
         .into_iter()
-        .filter(|path| {
-            let manifest_dir = path.manifest_path.parent().unwrap();
+        .filter(|package| package.metadata.get("nuttx").is_some())
+        .collect();
 
-            working_directory.starts_with(manifest_dir)
+    let working_directory = env::current_dir()?;
+    if let Some(package) = nuttx_packages
+        .iter()
+        .filter(|package| {
+            package
+                .manifest_path
+                .parent()
+                .is_some_and(|manifest_directory| working_directory.starts_with(manifest_directory))
         })
-        .max_by_key(|p| p.manifest_path.as_str().len())
-        .cloned()
-        .ok_or_else(|| "Could not determine current package; pass the -p flag".into())
+        .max_by_key(|package| package.manifest_path.as_str().len())
+    {
+        return Ok(package);
+    }
+
+    match nuttx_packages.as_slice() {
+        [package] => Ok(package),
+        [] => Err("No package in this workspace has a [package.metadata.nuttx] table".into()),
+        _ => Err("Several packages in this workspace have NuttX metadata; pick one with -p".into()),
+    }
 }
 
-pub fn find_potential_cargo_targets<'a>(
-    targets: impl IntoIterator<Item = &'a Target> + 'a,
-) -> impl Iterator<Item = &'a Target> + 'a {
-    targets.into_iter().filter(|target| target.is_staticlib())
+pub struct CargoInvocation<'a> {
+    pub subcommand: &'a str,
+    pub package: &'a Package,
+    pub release: bool,
+    pub jobs: Option<NonZero<usize>>,
+    pub board_metadata: &'a BoardSpecificMetadata,
+    pub include_directories: &'a [Utf8PathBuf],
+    pub extra_args: &'a [String],
 }
 
-pub fn build_cargo(
-    crate_name: &str,
-    build_target_name: &str,
-    release: bool,
-    board_metadata: &BoardSpecificMetadata,
-    include_directories: impl IntoIterator<Item = Utf8PathBuf>,
-) -> Result<Utf8PathBuf, Box<dyn Error>> {
-    let include_env_var_value = include_directories
-        .into_iter()
-        .map(|paths| paths.to_string())
+pub fn run_cargo(invocation: &CargoInvocation) -> Result<Option<Utf8PathBuf>, Box<dyn Error>> {
+    let include_env_var_value = invocation
+        .include_directories
+        .iter()
+        .map(|path| path.as_str())
         .collect::<Vec<_>>()
         .join(":");
 
-    // Get the old rust flags and add some knobs the user can directly set in the config file
-    let mut rustflags: Vec<_> = std::env::var("RUSTFLAGS")
-        .map(|flags| flags.split(" ").map(|flag| flag.to_string()).collect())
-        .unwrap_or_default();
-
-    if let Some(target_cpu) = &board_metadata.target_cpu {
-        rustflags.push(format!("-Ctarget-cpu={}", target_cpu));
-    }
-
-    if let Some(opt_level) = &board_metadata.opt_level {
-        rustflags.push(format!("-Copt-level={}", opt_level));
-    }
-
-    let mut args = vec![
-        "build",
-        "--message-format=json-render-diagnostics",
-        "-Zunstable-options",
-        "-Zbuild-std=std,panic_abort",
-        "-Zjson-target-spec",
-        "--target",
-        &board_metadata.target,
-        "--package",
-        crate_name,
-    ];
-
-    if release {
-        args.push("--release");
-    };
-
-    let mut child = Command::new("cargo")
-        .args(args)
+    let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command
+        .arg(invocation.subcommand)
+        .args([
+            "--message-format=json-render-diagnostics",
+            "-Zunstable-options",
+            "-Zbuild-std=std,panic_abort",
+            "-Zjson-target-spec",
+            "--target",
+            &invocation.board_metadata.target,
+            "--package",
+            &invocation.package.name,
+        ])
         .env("NUTTX_INCLUDE_DIR", include_env_var_value)
-        .env("RUSTFLAGS", rustflags.join(" "))
-        .stdout(Stdio::piped())
-        .spawn()?;
+        .stdout(Stdio::piped());
+
+    if invocation.subcommand == "build" {
+        command.arg("--lib");
+    }
+
+    if invocation.release {
+        command.arg("--release");
+    }
+
+    if let Some(jobs) = invocation.jobs {
+        command.arg(format!("--jobs={jobs}"));
+    }
+
+    add_rustflags(&mut command, invocation.board_metadata);
+    command.args(invocation.extra_args);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not run cargo: {error}"))?;
 
     let reader = BufReader::new(child.stdout.take().ok_or("No stdout")?);
     let mut staticlib_path = None;
 
     for message in Message::parse_stream(reader) {
-        if let Ok(Message::CompilerArtifact(artifact)) = message
-            && artifact.target.name == build_target_name
+        if let Message::CompilerArtifact(artifact) = message?
+            && artifact.package_id == invocation.package.id
             && artifact.target.is_staticlib()
-            && let Some(path) = artifact.filenames.first()
+            && let Some(path) = artifact
+                .filenames
+                .into_iter()
+                .find(|path| path.extension() == Some("a"))
         {
-            staticlib_path = Some(path.to_path_buf());
+            staticlib_path = Some(path);
         }
     }
 
-    child.wait()?;
+    let exit_status = child.wait()?;
+    if !exit_status.success() {
+        return Err(format!("cargo {} failed ({exit_status})", invocation.subcommand).into());
+    }
 
-    Ok(staticlib_path.ok_or("No staticlib produced!")?)
+    Ok(staticlib_path)
+}
+
+fn add_rustflags(command: &mut Command, board_metadata: &BoardSpecificMetadata) {
+    let mut board_flags = Vec::new();
+
+    if let Some(target_cpu) = &board_metadata.target_cpu {
+        board_flags.push(format!("-Ctarget-cpu={target_cpu}"));
+    }
+
+    if let Some(opt_level) = &board_metadata.opt_level {
+        board_flags.push(format!("-Copt-level={opt_level}"));
+    }
+
+    if board_flags.is_empty() {
+        return;
+    }
+
+    if let Ok(encoded) = env::var("CARGO_ENCODED_RUSTFLAGS") {
+        let mut flags: Vec<_> = encoded
+            .split('\x1f')
+            .filter(|flag| !flag.is_empty())
+            .map(str::to_string)
+            .collect();
+        flags.extend(board_flags);
+        command.env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f"));
+    } else {
+        let mut flags: Vec<_> = env::var("RUSTFLAGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        flags.extend(board_flags);
+        command.env("RUSTFLAGS", flags.join(" "));
+    }
 }

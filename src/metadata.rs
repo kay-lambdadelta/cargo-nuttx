@@ -1,36 +1,32 @@
-use std::{collections::HashMap, error::Error};
+use std::{collections::BTreeMap, error::Error};
 
 use camino::Utf8PathBuf;
 use cargo_metadata::Package;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Metadata {
-    #[serde(rename = "program-name")]
     pub program_name: Option<String>,
-    #[serde(rename = "entrypoint-symbol")]
     pub entrypoint_symbol: Option<String>,
     pub priority: u8,
-    #[serde(rename = "stack-size")]
     pub stack_size: u32,
     pub config: Option<Utf8PathBuf>,
+    pub board_config_directory: Option<Utf8PathBuf>,
+    pub nuttx_version: Option<String>,
     #[serde(default)]
-    pub boards: HashMap<String, BoardSpecificMetadata>,
-    #[serde(rename = "board-config-directory")]
-    pub board_config_directory: Utf8PathBuf,
+    pub boards: BTreeMap<String, BoardSpecificMetadata>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct BoardSpecificMetadata {
     pub target: String,
-    #[serde(rename = "firmware-file")]
     pub firmware_file: String,
-    #[serde(rename = "target-cpu")]
+    pub board_config: Option<String>,
     pub target_cpu: Option<String>,
-    #[serde(rename = "opt-level")]
     pub opt_level: Option<String>,
+    pub runner: Option<Vec<String>>,
 }
 
 pub fn get_nuttx_metadata(package: &Package) -> Result<Metadata, Box<dyn Error>> {
@@ -41,5 +37,21 @@ pub fn get_nuttx_metadata(package: &Package) -> Result<Metadata, Box<dyn Error>>
         )
     })?;
 
-    Ok(serde_json::from_value(raw_metadata.clone())?)
+    let mut metadata: Metadata = serde_json::from_value(raw_metadata.clone()).map_err(|error| {
+        format!(
+            "Invalid [package.metadata.nuttx] table in {}: {error}",
+            package.manifest_path
+        )
+    })?;
+
+    let manifest_directory = package
+        .manifest_path
+        .parent()
+        .ok_or("Package manifest has no parent directory")?;
+    metadata.config = metadata.config.map(|path| manifest_directory.join(path));
+    metadata.board_config_directory = metadata
+        .board_config_directory
+        .map(|path| manifest_directory.join(path));
+
+    Ok(metadata)
 }

@@ -1,80 +1,138 @@
-use std::ffi::OsString;
+use std::{ffi::OsString, num::NonZero};
 
 use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand};
 
-const DEFAULT_NUTTX_VERSION: &str = "13.0.0";
+pub const DEFAULT_NUTTX_VERSION: &str = "13.1.0";
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
-#[command(propagate_version = true)]
+#[command(name = "cargo", bin_name = "cargo")]
+pub enum Cargo {
+    #[command(name = "nuttx", version, about, long_about = None)]
+    Nuttx(Cli),
+}
+
+#[derive(Args)]
 pub struct Cli {
-    /// Specify the board to build for, using the name identifier NuttX uses
-    ///
-    /// For example, `--board raspberrypi-pico-2` will build for the Raspberry Pi Pico 2.
-    #[arg(long)]
-    pub board: String,
-    /// Specify the base board specific config to use
-    ///
-    /// Most board have a config named `nsh`, which allows basic shell access
-    #[arg(long, default_value = "nsh")]
-    pub board_config: String,
-    /// Clean the NuttX build directory before building (via `make distclean`)
-    ///
-    /// This is advisable when changing any configuration, so stale items don't interfere with the build, although this tool does attempt to mitigate the issue.
-    #[arg(long, global = true)]
-    pub clean: bool,
-    /// Specify a package to build (default: the first viable package this tool finds)
-    ///
-    /// This is equivalent to the same native `cargo` flag
-    #[arg(long, short, global = true)]
-    pub package: Option<String>,
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Command,
+}
+
+impl Cli {
+    pub fn parse() -> Self {
+        let mut args: Vec<_> = std::env::args_os().collect();
+        let driver_args = args
+            .iter()
+            .position(|arg| arg == "--")
+            .map(|separator| args.split_off(separator))
+            .unwrap_or_default();
+
+        let Cargo::Nuttx(mut cli) = Cargo::parse_from(args);
+        let common = cli.command.common_mut();
+        common.cargo_args.extend(
+            driver_args
+                .into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned()),
+        );
+
+        cli
+    }
+}
+
+impl Command {
+    fn common_mut(&mut self) -> &mut CommonArgs {
+        match self {
+            Command::Build(args) | Command::Run(args) => &mut args.common,
+            Command::Check(args) | Command::Clippy(args) => args,
+        }
+    }
 }
 
 #[derive(Subcommand)]
-pub enum Commands {
-    /// Build the crate and NuttX, linking them together into a firmware image
-    Build {
-        #[command(flatten)]
-        nuttx_location: NuttxLocationArgs,
-        /// Build using release profile optimizations
-        ///
-        /// This is equivalent to the same native `cargo` flag
-        #[arg(long)]
-        release: bool,
-        /// Extra arguments to pass to `make` at the *build* stage of NuttX
-        #[arg(last = true)]
-        make_args: Vec<OsString>,
-    },
+pub enum Command {
+    /// Build the crate and link it into a NuttX firmware image
+    Build(BuildArgs),
+    /// Build the firmware image, then hand it to the board's `runner` command
+    Run(BuildArgs),
+    /// Check the crate against the configured NuttX headers
+    Check(CommonArgs),
+    /// Run clippy on the crate against the configured NuttX headers
+    Clippy(CommonArgs),
 }
 
-#[derive(Clone)]
+#[derive(Args)]
+pub struct BuildArgs {
+    /// Extra argument to pass to `make` when building NuttX (can be repeated)
+    #[arg(long = "make-arg", value_name = "ARG", allow_hyphen_values = true)]
+    pub make_args: Vec<OsString>,
+    #[command(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Args)]
+pub struct CommonArgs {
+    /// NuttX board to build for, as named by `tools/configure.sh`
+    ///
+    /// Defaults to the only board in the package metadata, if there is exactly one.
+    #[arg(long, short)]
+    pub board: Option<String>,
+    /// Board configuration to start from
+    ///
+    /// Defaults to the board's `board-config` metadata, or `nsh`.
+    #[arg(long)]
+    pub board_config: Option<String>,
+    #[command(flatten)]
+    pub nuttx: NuttxArgs,
+    /// Package to build
+    #[arg(long, short)]
+    pub package: Option<String>,
+    /// Build with the release profile
+    #[arg(long, short)]
+    pub release: bool,
+    /// Number of parallel jobs for cargo and make (default: number of CPUs)
+    #[arg(long, short)]
+    pub jobs: Option<NonZero<usize>>,
+    /// Run `make distclean` and configure NuttX from scratch
+    #[arg(long)]
+    pub clean: bool,
+    /// Extra arguments passed through to cargo; anything after `--` goes to rustc or clippy
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "CARGO_ARGS"
+    )]
+    pub cargo_args: Vec<String>,
+}
+
+#[derive(Args)]
+#[group(multiple = false)]
+pub struct NuttxArgs {
+    /// Use an existing NuttX workspace containing `nuttx` and `apps` directories
+    #[arg(long, value_name = "DIR")]
+    pub nuttx_path: Option<Utf8PathBuf>,
+    /// NuttX release to download into the cache and build against
+    ///
+    /// Defaults to the `nuttx-version` metadata, or the latest version this tool was tested with.
+    #[arg(long, value_name = "VERSION")]
+    pub nuttx_version: Option<String>,
+}
+
 pub enum NuttxLocation {
     Path { root: Utf8PathBuf },
     Download { version: String },
 }
 
-#[derive(Args, Clone)]
-#[group(multiple = false, required = true)]
-pub struct NuttxLocationArgs {
-    /// Path to the directory containing NuttX pre-extracted
-    ///
-    /// The structure expected should have a `nuttx` and an `apps` directory.
-    #[arg(long)]
-    path: Option<Utf8PathBuf>,
-    /// Downloads NuttX from the official servers and extracts and uses it internally
-    #[arg(long, num_args = 0..=1, default_missing_value = DEFAULT_NUTTX_VERSION)]
-    download: Option<String>,
-}
-
-impl From<NuttxLocationArgs> for NuttxLocation {
-    fn from(args: NuttxLocationArgs) -> Self {
-        match (args.path, args.download) {
-            (Some(root), _) => NuttxLocation::Path { root },
-            (None, Some(version)) => NuttxLocation::Download { version },
-            _ => unreachable!("clap group enforces exactly one"),
+impl NuttxArgs {
+    pub fn location(&self, metadata_version: Option<&str>) -> NuttxLocation {
+        match (&self.nuttx_path, &self.nuttx_version) {
+            (Some(root), _) => NuttxLocation::Path { root: root.clone() },
+            (None, version) => NuttxLocation::Download {
+                version: version
+                    .as_deref()
+                    .or(metadata_version)
+                    .unwrap_or(DEFAULT_NUTTX_VERSION)
+                    .to_string(),
+            },
         }
     }
 }
