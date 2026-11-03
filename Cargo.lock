@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-nuttx"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "camino",
  "cargo_metadata",
