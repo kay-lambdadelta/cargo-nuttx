@@ -1,6 +1,6 @@
 [package]
 name = "cargo-nuttx"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 rust-version = "1.95"
 description = "A cargo subcommand for building NuttX-based embedded projects into firmware images"
