@@ -1,7 +1,7 @@
 use std::{
     env,
     error::Error,
-    io::BufReader,
+    io::{BufRead, BufReader, Write, stdout},
     num::NonZero,
     process::{Command, Stdio},
 };
@@ -68,11 +68,17 @@ pub fn run_cargo(invocation: &CargoInvocation) -> Result<Option<Utf8PathBuf>, Bo
         .collect::<Vec<_>>()
         .join(":");
 
+    let forward_messages = has_message_format(invocation.extra_args);
+
     let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command.arg(invocation.subcommand);
+
+    if !forward_messages {
+        command.arg("--message-format=json-render-diagnostics");
+    }
+
     command
-        .arg(invocation.subcommand)
         .args([
-            "--message-format=json-render-diagnostics",
             "-Zunstable-options",
             "-Zbuild-std=std,panic_abort",
             "-Zjson-target-spec",
@@ -106,8 +112,14 @@ pub fn run_cargo(invocation: &CargoInvocation) -> Result<Option<Utf8PathBuf>, Bo
     let reader = BufReader::new(child.stdout.take().ok_or("No stdout")?);
     let mut staticlib_path = None;
 
-    for message in Message::parse_stream(reader) {
-        if let Message::CompilerArtifact(artifact) = message?
+    for line in reader.lines() {
+        let line = line?;
+
+        if forward_messages {
+            writeln!(stdout(), "{line}")?;
+        }
+
+        if let Ok(Message::CompilerArtifact(artifact)) = serde_json::from_str(&line)
             && artifact.package_id == invocation.package.id
             && artifact.target.is_staticlib()
             && let Some(path) = artifact
@@ -125,6 +137,13 @@ pub fn run_cargo(invocation: &CargoInvocation) -> Result<Option<Utf8PathBuf>, Bo
     }
 
     Ok(staticlib_path)
+}
+
+fn has_message_format(extra_args: &[String]) -> bool {
+    extra_args
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--message-format" || arg.starts_with("--message-format="))
 }
 
 fn add_rustflags(command: &mut Command, board_metadata: &BoardSpecificMetadata) {

@@ -8,7 +8,7 @@ use convert_case::{Case, Casing};
 use dirs::cache_dir;
 use flate2::read::GzDecoder;
 
-use crate::{cli::NuttxLocation, process::run};
+use crate::{cli::NuttxLocation, process::run_build_step};
 
 const NUTTX_MIRRORS: [&str; 2] = [
     "https://dlcdn.apache.org/nuttx",
@@ -105,9 +105,11 @@ impl NuttxTree {
         if !already_configured {
             if config_path.exists() {
                 eprintln!("Cleaning NuttX");
-                run(Command::new("make")
-                    .current_dir(&self.nuttx)
-                    .arg("distclean"))?;
+                run_build_step(
+                    Command::new("make")
+                        .current_dir(&self.nuttx)
+                        .arg("distclean"),
+                )?;
             }
 
             remove_dir_if_exists(&state_directory)?;
@@ -117,9 +119,11 @@ impl NuttxTree {
 
         if !already_configured {
             eprintln!("Configuring NuttX for {board_spec}");
-            run(Command::new("./tools/configure.sh")
-                .current_dir(&self.nuttx)
-                .arg(&board_spec))?;
+            run_build_step(
+                Command::new("./tools/configure.sh")
+                    .current_dir(&self.nuttx)
+                    .arg(&board_spec),
+            )?;
 
             fs::create_dir_all(&state_directory)?;
             fs::copy(&config_path, &pristine_config_path)?;
@@ -140,19 +144,21 @@ impl NuttxTree {
         if !config_path.is_file() || applied_config.as_ref() != Some(&config) {
             if applied_config.is_some() {
                 eprintln!("Cleaning NuttX build outputs after a config change");
-                run(Command::new("make").current_dir(&self.nuttx).arg("clean"))?;
+                run_build_step(Command::new("make").current_dir(&self.nuttx).arg("clean"))?;
             }
 
             fs::write(&config_path, &config)?;
-            run(Command::new("make")
-                .current_dir(&self.nuttx)
-                .arg("olddefconfig"))?;
+            run_build_step(
+                Command::new("make")
+                    .current_dir(&self.nuttx)
+                    .arg("olddefconfig"),
+            )?;
             fs::write(&applied_config_path, &config)?;
         }
 
         // Setup the headers
         self.invalidate_openlibm_placeholder()?;
-        run(Command::new("make").current_dir(&self.nuttx).arg("context"))?;
+        run_build_step(Command::new("make").current_dir(&self.nuttx).arg("context"))?;
         self.write_openlibm_placeholder()?;
 
         Ok(())
@@ -224,10 +230,12 @@ impl NuttxTree {
         };
 
         eprintln!("Building NuttX");
-        run(Command::new("make")
-            .current_dir(&self.nuttx)
-            .arg(format!("--jobs={jobs}"))
-            .args(make_args))
+        run_build_step(
+            Command::new("make")
+                .current_dir(&self.nuttx)
+                .arg(format!("--jobs={jobs}"))
+                .args(make_args),
+        )
     }
 
     fn install_app(

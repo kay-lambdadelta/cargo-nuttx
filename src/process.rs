@@ -1,4 +1,4 @@
-use std::{error::Error, process::Command};
+use std::{error::Error, io::stderr, process::Command};
 
 pub fn run(command: &mut Command) -> Result<(), Box<dyn Error>> {
     let program = command.get_program().to_string_lossy().into_owned();
@@ -11,4 +11,8 @@ pub fn run(command: &mut Command) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+pub fn run_build_step(command: &mut Command) -> Result<(), Box<dyn Error>> {
+    run(command.stdout(stderr()))
 }
