@@ -6,8 +6,8 @@ use std::{
     process::{Command, Stdio},
 };
 
-use camino::Utf8PathBuf;
-use cargo_metadata::{Message, Metadata, Package};
+use camino::{Utf8Path, Utf8PathBuf};
+use cargo_metadata::{Artifact, Message, Metadata, Package};
 
 use crate::metadata::BoardSpecificMetadata;
 
@@ -50,9 +50,33 @@ pub fn find_package<'a>(
     }
 }
 
+pub enum CrateSelection<'a> {
+    WorkspacePackage(&'a Package),
+    Manifest(&'a Utf8Path),
+}
+
+impl CrateSelection<'_> {
+    fn add_args(&self, command: &mut Command) {
+        match self {
+            Self::WorkspacePackage(package) => command.args(["--package", &package.name]),
+            Self::Manifest(directory) => command
+                .arg("--manifest-path")
+                .arg(directory.join("Cargo.toml")),
+        };
+    }
+
+    fn matches(&self, artifact: &Artifact) -> bool {
+        match self {
+            Self::WorkspacePackage(package) => artifact.package_id == package.id,
+            Self::Manifest(directory) => artifact.manifest_path == directory.join("Cargo.toml"),
+        }
+    }
+}
+
 pub struct CargoInvocation<'a> {
     pub subcommand: &'a str,
-    pub package: &'a Package,
+    pub selection: CrateSelection<'a>,
+    pub build_std: &'a str,
     pub release: bool,
     pub jobs: Option<NonZero<usize>>,
     pub board_metadata: &'a BoardSpecificMetadata,
@@ -80,15 +104,15 @@ pub fn run_cargo(invocation: &CargoInvocation) -> Result<Option<Utf8PathBuf>, Bo
     command
         .args([
             "-Zunstable-options",
-            "-Zbuild-std=std,panic_abort",
+            &format!("-Zbuild-std={}", invocation.build_std),
             "-Zjson-target-spec",
             "--target",
             &invocation.board_metadata.target,
-            "--package",
-            &invocation.package.name,
         ])
         .env("NUTTX_INCLUDE_DIR", include_env_var_value)
         .stdout(Stdio::piped());
+
+    invocation.selection.add_args(&mut command);
 
     if invocation.subcommand == "build" {
         command.arg("--lib");
@@ -120,7 +144,7 @@ pub fn run_cargo(invocation: &CargoInvocation) -> Result<Option<Utf8PathBuf>, Bo
         }
 
         if let Ok(Message::CompilerArtifact(artifact)) = serde_json::from_str(&line)
-            && artifact.package_id == invocation.package.id
+            && invocation.selection.matches(&artifact)
             && artifact.target.is_staticlib()
             && let Some(path) = artifact
                 .filenames

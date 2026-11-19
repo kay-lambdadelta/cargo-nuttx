@@ -27,6 +27,8 @@ pub struct BoardSpecificMetadata {
     pub target_cpu: Option<String>,
     pub opt_level: Option<String>,
     pub runner: Option<Vec<String>>,
+    pub custom_board: Option<Utf8PathBuf>,
+    pub board_crate: Option<Utf8PathBuf>,
 }
 
 pub fn get_nuttx_metadata(package: &Package) -> Result<Metadata, Box<dyn Error>> {
@@ -52,6 +54,22 @@ pub fn get_nuttx_metadata(package: &Package) -> Result<Metadata, Box<dyn Error>>
     metadata.board_config_directory = metadata
         .board_config_directory
         .map(|path| manifest_directory.join(path));
+
+    for board in metadata.boards.values_mut() {
+        if board.target.ends_with(".json") {
+            board.target = manifest_directory.join(&board.target).into_string();
+        }
+
+        board.custom_board = board
+            .custom_board
+            .take()
+            .map(|path| manifest_directory.join(path));
+
+        board.board_crate = board
+            .board_crate
+            .take()
+            .map(|path| manifest_directory.join(path));
+    }
 
     Ok(metadata)
 }

@@ -5,10 +5,10 @@ use cargo_metadata::{MetadataCommand, Package};
 use convert_case::{Case, Casing};
 
 use crate::{
-    cargo::{CargoInvocation, find_package, run_cargo},
+    cargo::{CargoInvocation, CrateSelection, find_package, run_cargo},
     cli::{BuildArgs, Cli, Command, CommonArgs},
     metadata::{BoardSpecificMetadata, Metadata, get_nuttx_metadata},
-    nuttx::{AppConfig, NuttxTree},
+    nuttx::{AppConfig, NuttxTree, write_if_changed},
     process::run,
 };
 
@@ -165,7 +165,43 @@ impl Project {
 
     fn configure(&self, clean: bool) -> Result<(), Box<dyn Error>> {
         self.tree
-            .configure(&self.board, &self.board_config, &self.app_config(), clean)
+            .configure(&self.board_specification()?, &self.app_config(), clean)
+    }
+
+    fn board_specification(&self) -> Result<String, Box<dyn Error>> {
+        let Some(custom_board) = &self.board_metadata().custom_board else {
+            return Ok(format!("{}:{}", self.board, self.board_config));
+        };
+
+        let source_directory = custom_board.join("configs").join(&self.board_config);
+        let generated_directory = self
+            .target_directory
+            .join("nuttx")
+            .join(&self.board)
+            .join("configs")
+            .join(&self.board_config);
+        fs::create_dir_all(&generated_directory)?;
+
+        let mut defconfig = fs::read_to_string(source_directory.join("defconfig"))
+            .map_err(|error| format!("Could not read defconfig in {source_directory}: {error}"))?;
+
+        defconfig.push_str(&format!(
+            "\nCONFIG_ARCH_BOARD_CUSTOM_DIR=\"{custom_board}\"\n# \
+             CONFIG_ARCH_BOARD_CUSTOM_DIR_RELPATH is not set\n"
+        ));
+
+        let defconfig_path = generated_directory.join("defconfig");
+        if fs::read_to_string(&defconfig_path).ok().as_ref() != Some(&defconfig) {
+            fs::write(&defconfig_path, &defconfig)?;
+
+            self.tree.invalidate_configuration()?;
+        }
+
+        let make_defs = fs::read_to_string(custom_board.join("scripts").join("Make.defs"))
+            .map_err(|error| format!("Could not read Make.defs in {custom_board}: {error}"))?;
+        write_if_changed(&generated_directory.join("Make.defs"), &make_defs)?;
+
+        Ok(generated_directory.into_string())
     }
 
     fn cargo(
@@ -175,13 +211,34 @@ impl Project {
     ) -> Result<Option<Utf8PathBuf>, Box<dyn Error>> {
         run_cargo(&CargoInvocation {
             subcommand,
-            package: &self.package,
+            selection: CrateSelection::WorkspacePackage(&self.package),
+            build_std: "std,panic_abort",
             release: args.release,
             jobs: args.jobs,
             board_metadata: self.board_metadata(),
             include_directories: &self.tree.include_directories(),
             extra_args: &args.cargo_args,
         })
+    }
+
+    fn board_crate(&self, args: &CommonArgs) -> Result<Option<Utf8PathBuf>, Box<dyn Error>> {
+        let Some(board_crate) = &self.board_metadata().board_crate else {
+            return Ok(None);
+        };
+
+        let staticlib_path = run_cargo(&CargoInvocation {
+            subcommand: "build",
+            selection: CrateSelection::Manifest(board_crate),
+            build_std: "core",
+            release: args.release,
+            jobs: args.jobs,
+            board_metadata: self.board_metadata(),
+            include_directories: &self.tree.include_directories(),
+            extra_args: &[],
+        })?
+        .ok_or_else(|| format!("Board crate {board_crate} did not produce a static library"))?;
+
+        Ok(Some(staticlib_path))
     }
 }
 
@@ -198,11 +255,18 @@ fn build(args: &BuildArgs) -> Result<(Project, Utf8PathBuf), Box<dyn Error>> {
     let staticlib_path = project
         .cargo("build", common)?
         .ok_or("cargo did not produce a static library")?;
+    let board_staticlib_path = project.board_crate(common)?;
+
+    let staticlib_paths: Vec<_> = [Some(&staticlib_path), board_staticlib_path.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|path| path.as_path())
+        .collect();
 
     let app = project.app_config();
     project
         .tree
-        .build(&app, &staticlib_path, common.jobs, &args.make_args)?;
+        .build(&app, &staticlib_paths, common.jobs, &args.make_args)?;
 
     let output_directory = project
         .target_directory

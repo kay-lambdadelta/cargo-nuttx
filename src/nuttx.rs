@@ -77,6 +77,13 @@ impl NuttxTree {
         Ok(tree)
     }
 
+    pub fn invalidate_configuration(&self) -> io::Result<()> {
+        match fs::remove_file(self.nuttx.join(STATE_DIRECTORY).join("configured")) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    }
+
     pub fn include_directories(&self) -> Vec<Utf8PathBuf> {
         vec![
             self.nuttx.join("include"),
@@ -86,8 +93,7 @@ impl NuttxTree {
 
     pub fn configure(
         &self,
-        board: &str,
-        board_config: &str,
+        board_spec: &str,
         app: &AppConfig,
         clean: bool,
     ) -> Result<(), Box<dyn Error>> {
@@ -96,7 +102,6 @@ impl NuttxTree {
         let pristine_config_path = state_directory.join("pristine.config");
         let applied_config_path = state_directory.join("applied.config");
         let config_path = self.nuttx.join(".config");
-        let board_spec = format!("{board}:{board_config}");
 
         let already_configured = !clean
             && pristine_config_path.is_file()
@@ -115,19 +120,19 @@ impl NuttxTree {
             remove_dir_if_exists(&state_directory)?;
         }
 
-        self.install_app(app, None)?;
+        self.install_app(app, &[])?;
 
         if !already_configured {
             eprintln!("Configuring NuttX for {board_spec}");
             run_build_step(
                 Command::new("./tools/configure.sh")
                     .current_dir(&self.nuttx)
-                    .arg(&board_spec),
+                    .arg(board_spec),
             )?;
 
             fs::create_dir_all(&state_directory)?;
             fs::copy(&config_path, &pristine_config_path)?;
-            fs::write(&configured_marker, &board_spec)?;
+            fs::write(&configured_marker, board_spec)?;
         }
 
         // Inject the config fragments for the crate
@@ -218,11 +223,11 @@ impl NuttxTree {
     pub fn build(
         &self,
         app: &AppConfig,
-        staticlib_path: &Utf8Path,
+        staticlib_paths: &[&Utf8Path],
         jobs: Option<NonZero<usize>>,
         make_args: &[OsString],
     ) -> Result<(), Box<dyn Error>> {
-        self.install_app(app, Some(staticlib_path))?;
+        self.install_app(app, staticlib_paths)?;
 
         let jobs = match jobs {
             Some(jobs) => jobs,
@@ -241,7 +246,7 @@ impl NuttxTree {
     fn install_app(
         &self,
         app: &AppConfig,
-        staticlib_path: Option<&Utf8Path>,
+        staticlib_paths: &[&Utf8Path],
     ) -> Result<(), Box<dyn Error>> {
         let external_directory = self.apps.join("external");
         let shim_destination = external_directory.join(app.crate_name);
@@ -266,7 +271,7 @@ impl NuttxTree {
         write_if_changed(&shim_destination.join("Kconfig"), &form_kconfig(app))?;
         write_if_changed(
             &shim_destination.join("Make.defs"),
-            &form_make_defs(app, staticlib_path),
+            &form_make_defs(app, staticlib_paths),
         )?;
         write_if_changed(&shim_destination.join("Makefile"), &form_makefile(app))?;
 
@@ -303,12 +308,13 @@ endif
     )
 }
 
-fn form_make_defs(app: &AppConfig, staticlib_path: Option<&Utf8Path>) -> String {
+fn form_make_defs(app: &AppConfig, staticlib_paths: &[&Utf8Path]) -> String {
     let symbol = app.config_symbol();
     let crate_name = app.crate_name;
-    let extra_libs = staticlib_path
+    let extra_libs: String = staticlib_paths
+        .iter()
         .map(|path| format!("    EXTRA_LIBS += \"{path}\"\n"))
-        .unwrap_or_default();
+        .collect();
 
     format!(
         "
@@ -395,7 +401,8 @@ fn fetch_archive(
     Err(format!("NuttX {version} was not found on any Apache mirror").into())
 }
 
-fn write_if_changed(path: &Utf8Path, contents: &str) -> io::Result<()> {
+#[inline]
+pub fn write_if_changed(path: &Utf8Path, contents: &str) -> io::Result<()> {
     if fs::read_to_string(path).is_ok_and(|existing| existing == contents) {
         return Ok(());
     }
