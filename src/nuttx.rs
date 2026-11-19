@@ -1,5 +1,5 @@
 use std::{
-    error::Error, ffi::OsString, fs, io, num::NonZeroUsize, process::Command,
+    error::Error, ffi::OsString, fs, io, num::NonZero, process::Command,
     thread::available_parallelism, time::SystemTime,
 };
 
@@ -219,7 +219,7 @@ impl NuttxTree {
         &self,
         app: &AppConfig,
         staticlib_path: &Utf8Path,
-        jobs: Option<NonZeroUsize>,
+        jobs: Option<NonZero<usize>>,
         make_args: &[OsString],
     ) -> Result<(), Box<dyn Error>> {
         self.install_app(app, Some(staticlib_path))?;
