@@ -29,6 +29,7 @@ pub struct BoardSpecificMetadata {
     pub runner: Option<Vec<String>>,
     pub custom_board: Option<Utf8PathBuf>,
     pub board_crate: Option<Utf8PathBuf>,
+    pub linker_script: Option<Utf8PathBuf>,
 }
 
 pub fn get_nuttx_metadata(package: &Package) -> Result<Metadata, Box<dyn Error>> {
@@ -67,6 +68,11 @@ pub fn get_nuttx_metadata(package: &Package) -> Result<Metadata, Box<dyn Error>>
 
         board.board_crate = board
             .board_crate
+            .take()
+            .map(|path| manifest_directory.join(path));
+
+        board.linker_script = board
+            .linker_script
             .take()
             .map(|path| manifest_directory.join(path));
     }

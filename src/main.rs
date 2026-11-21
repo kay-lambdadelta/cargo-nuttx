@@ -1,4 +1,4 @@
-use std::{error::Error, fs, process::ExitCode};
+use std::{error::Error, ffi::OsString, fs, process::ExitCode};
 
 use camino::Utf8PathBuf;
 use cargo_metadata::{MetadataCommand, Package};
@@ -221,6 +221,25 @@ impl Project {
         })
     }
 
+    fn linker_script_make_args(&self) -> Result<Vec<OsString>, Box<dyn Error>> {
+        let Some(linker_script) = &self.board_metadata().linker_script else {
+            return Ok(Vec::new());
+        };
+
+        let file_name = linker_script
+            .file_name()
+            .ok_or_else(|| format!("linker-script {linker_script} has no file name"))?;
+        let contents = fs::read_to_string(linker_script)
+            .map_err(|error| format!("Could not read linker script {linker_script}: {error}"))?;
+
+        let generated_directory = self.target_directory.join("nuttx").join(&self.board);
+        fs::create_dir_all(&generated_directory)?;
+        let generated_path = generated_directory.join(file_name);
+        write_if_changed(&generated_path, &contents)?;
+
+        Ok(vec![format!("ARCHSCRIPT={generated_path}").into()])
+    }
+
     fn board_crate(&self, args: &CommonArgs) -> Result<Option<Utf8PathBuf>, Box<dyn Error>> {
         let Some(board_crate) = &self.board_metadata().board_crate else {
             return Ok(None);
@@ -263,10 +282,13 @@ fn build(args: &BuildArgs) -> Result<(Project, Utf8PathBuf), Box<dyn Error>> {
         .map(|path| path.as_path())
         .collect();
 
+    let mut make_args = project.linker_script_make_args()?;
+    make_args.extend(args.make_args.iter().cloned());
+
     let app = project.app_config();
     project
         .tree
-        .build(&app, &staticlib_paths, common.jobs, &args.make_args)?;
+        .build(&app, &staticlib_paths, common.jobs, &make_args)?;
 
     let output_directory = project
         .target_directory
