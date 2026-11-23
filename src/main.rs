@@ -277,8 +277,8 @@ fn resolve_target(
 ) -> Result<String, Box<dyn Error>> {
     match (&board_metadata.target, &board_files.target_specification) {
         (Some(target), None) if target.ends_with(".json") => Err(format!(
-            "Board {board} names a target specification file, instead of a target triplet. Move it to \
-             boards/{board}/target.json and remove `target`"
+            "Board {board} names a target specification file, instead of a target triplet. Move \
+             it to boards/{board}/target.json and remove `target`"
         )
         .into()),
         (Some(target), None) => Ok(target.clone()),
