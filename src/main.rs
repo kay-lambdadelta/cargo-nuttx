@@ -7,15 +7,19 @@ use convert_case::{Case, Casing};
 use crate::{
     cargo::{CargoInvocation, CrateSelection, find_package, run_cargo},
     cli::{BuildArgs, Cli, Command, CommonArgs},
+    layout::{BoardFiles, GlobalFiles},
     metadata::{BoardSpecificMetadata, Metadata, get_nuttx_metadata},
     nuttx::{AppConfig, NuttxTree, write_if_changed},
+    patch::collect_patches,
     process::run,
 };
 
 mod cargo;
 mod cli;
+mod layout;
 mod metadata;
 mod nuttx;
+mod patch;
 mod process;
 
 fn main() -> ExitCode {
@@ -42,10 +46,12 @@ struct Project {
     metadata: Metadata,
     board: String,
     board_config: String,
+    target: String,
     target_directory: Utf8PathBuf,
     program_name: String,
     entrypoint_symbol: String,
     config_fragments: Vec<String>,
+    board_files: BoardFiles,
     tree: NuttxTree,
 }
 
@@ -109,30 +115,29 @@ impl Project {
             .clone()
             .unwrap_or_else(|| format!("{snake_case_name}_main"));
 
-        let mut config_fragments = Vec::new();
+        let global_files = GlobalFiles::locate(metadata.directory.as_deref());
+        let board_files = BoardFiles::locate(metadata.directory.as_deref(), &board);
 
-        if let Some(config_path) = &metadata.config {
-            config_fragments.push(read_config_fragment(config_path)?);
-        }
+        let target = resolve_target(&board, board_metadata, &board_files)?;
 
-        if let Some(board_config_directory) = &metadata.board_config_directory {
-            if !board_config_directory.is_dir() {
-                return Err(format!(
-                    "board-config-directory {board_config_directory} does not exist"
-                )
-                .into());
-            }
+        let config_fragments = [&global_files.config, &board_files.config]
+            .into_iter()
+            .flatten()
+            .map(read_config_fragment)
+            .collect::<Result<Vec<_>, _>>()?;
 
-            let board_config_path = board_config_directory.join(&board);
-            if board_config_path.is_file() {
-                config_fragments.push(read_config_fragment(&board_config_path)?);
-            }
-        }
+        let patch_directories = [&global_files.patch_directory, &board_files.patch_directory]
+            .into_iter()
+            .flatten()
+            .map(Utf8PathBuf::as_path)
+            .collect::<Vec<_>>();
+        let patches = collect_patches(&patch_directories)?;
 
         let tree = NuttxTree::locate(
             args.nuttx.location(metadata.nuttx_version.as_deref()),
             &package.name,
             &board,
+            &patches,
         )?;
 
         Ok(Self {
@@ -140,10 +145,12 @@ impl Project {
             metadata,
             board,
             board_config,
+            target,
             target_directory: cargo_meta.target_directory,
             program_name,
             entrypoint_symbol,
             config_fragments,
+            board_files,
             tree,
         })
     }
@@ -169,7 +176,7 @@ impl Project {
     }
 
     fn board_specification(&self) -> Result<String, Box<dyn Error>> {
-        let Some(custom_board) = &self.board_metadata().custom_board else {
+        let Some(custom_board) = &self.board_files.custom_board else {
             return Ok(format!("{}:{}", self.board, self.board_config));
         };
 
@@ -213,6 +220,7 @@ impl Project {
             subcommand,
             selection: CrateSelection::WorkspacePackage(&self.package),
             build_std: "std,panic_abort",
+            target: &self.target,
             release: args.release,
             jobs: args.jobs,
             board_metadata: self.board_metadata(),
@@ -222,13 +230,13 @@ impl Project {
     }
 
     fn linker_script_make_args(&self) -> Result<Vec<OsString>, Box<dyn Error>> {
-        let Some(linker_script) = &self.board_metadata().linker_script else {
+        let Some(linker_script) = &self.board_files.linker_script else {
             return Ok(Vec::new());
         };
 
         let file_name = linker_script
             .file_name()
-            .ok_or_else(|| format!("linker-script {linker_script} has no file name"))?;
+            .ok_or_else(|| format!("Linker script {linker_script} has no file name"))?;
         let contents = fs::read_to_string(linker_script)
             .map_err(|error| format!("Could not read linker script {linker_script}: {error}"))?;
 
@@ -241,7 +249,7 @@ impl Project {
     }
 
     fn board_crate(&self, args: &CommonArgs) -> Result<Option<Utf8PathBuf>, Box<dyn Error>> {
-        let Some(board_crate) = &self.board_metadata().board_crate else {
+        let Some(board_crate) = &self.board_files.board_crate else {
             return Ok(None);
         };
 
@@ -249,6 +257,7 @@ impl Project {
             subcommand: "build",
             selection: CrateSelection::Manifest(board_crate),
             build_std: "core",
+            target: &self.target,
             release: args.release,
             jobs: args.jobs,
             board_metadata: self.board_metadata(),
@@ -258,6 +267,28 @@ impl Project {
         .ok_or_else(|| format!("Board crate {board_crate} did not produce a static library"))?;
 
         Ok(Some(staticlib_path))
+    }
+}
+
+fn resolve_target(
+    board: &str,
+    board_metadata: &BoardSpecificMetadata,
+    board_files: &BoardFiles,
+) -> Result<String, Box<dyn Error>> {
+    match (&board_metadata.target, &board_files.target_specification) {
+        (Some(target), None) if target.ends_with(".json") => Err(format!(
+            "Board {board} names a target specification file, instead of a target triplet. Move it to \
+             boards/{board}/target.json and remove `target`"
+        )
+        .into()),
+        (Some(target), None) => Ok(target.clone()),
+        (None, Some(target_specification)) => Ok(target_specification.to_string()),
+        (Some(_), Some(target_specification)) => {
+            Err(format!("Board {board} sets `target` and has {target_specification}").into())
+        }
+        (None, None) => {
+            Err(format!("Board {board} has no `target` and no boards/{board}/target.json").into())
+        }
     }
 }
 

@@ -77,6 +77,7 @@ pub struct CargoInvocation<'a> {
     pub subcommand: &'a str,
     pub selection: CrateSelection<'a>,
     pub build_std: &'a str,
+    pub target: &'a str,
     pub release: bool,
     pub jobs: Option<NonZero<usize>>,
     pub board_metadata: &'a BoardSpecificMetadata,
@@ -107,7 +108,7 @@ pub fn run_cargo(invocation: &CargoInvocation) -> Result<Option<Utf8PathBuf>, Bo
             &format!("-Zbuild-std={}", invocation.build_std),
             "-Zjson-target-spec",
             "--target",
-            &invocation.board_metadata.target,
+            invocation.target,
         ])
         .env("NUTTX_INCLUDE_DIR", include_env_var_value)
         .stdout(Stdio::piped());

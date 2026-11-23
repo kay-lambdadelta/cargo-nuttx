@@ -8,7 +8,11 @@ use convert_case::{Case, Casing};
 use dirs::cache_dir;
 use flate2::read::GzDecoder;
 
-use crate::{cli::NuttxLocation, process::run_build_step};
+use crate::{
+    cli::NuttxLocation,
+    patch::{PatchFile, apply_patches, fingerprint},
+    process::run_build_step,
+};
 
 const NUTTX_MIRRORS: [&str; 2] = [
     "https://dlcdn.apache.org/nuttx",
@@ -16,6 +20,7 @@ const NUTTX_MIRRORS: [&str; 2] = [
 ];
 
 const STATE_DIRECTORY: &str = concat!(".", env!("CARGO_PKG_NAME"));
+const APPLIED_PATCHES_FILE: &str = concat!(".", env!("CARGO_PKG_NAME"), "-patches");
 
 pub struct AppConfig<'a> {
     pub crate_name: &'a str,
@@ -42,21 +47,36 @@ impl NuttxTree {
         location: NuttxLocation,
         crate_name: &str,
         board: &str,
+        patches: &[PatchFile],
     ) -> Result<Self, Box<dyn Error>> {
         let root = match location {
-            NuttxLocation::Path { root } => root,
+            NuttxLocation::Path { root } => {
+                if !patches.is_empty() {
+                    eprintln!(
+                        "warning: {} NuttX patches are not applied to the existing workspace at \
+                         {root}",
+                        patches.len()
+                    );
+                }
+
+                root
+            }
             NuttxLocation::Download { version } => {
-                let root = Utf8PathBuf::try_from(
+                let version_directory = Utf8PathBuf::try_from(
                     cache_dir()
                         .ok_or("Could not locate cache dir for your os")?
                         .join(env!("CARGO_CRATE_NAME"))
                         .join("nuttx")
-                        .join(&version)
-                        .join(crate_name)
-                        .join(board),
+                        .join(&version),
                 )?;
+                let root = version_directory.join(crate_name).join(board);
 
-                download_nuttx(&version, &root)?;
+                prepare_download(
+                    &version,
+                    &version_directory.join("archives"),
+                    &root,
+                    patches,
+                )?;
 
                 root
             }
@@ -361,9 +381,23 @@ CONFIG_LIBM_OPENLIBM=y
     )
 }
 
-fn download_nuttx(version: &str, destination: &Utf8Path) -> Result<(), Box<dyn Error>> {
+fn prepare_download(
+    version: &str,
+    archive_directory: &Utf8Path,
+    destination: &Utf8Path,
+    patches: &[PatchFile],
+) -> Result<(), Box<dyn Error>> {
+    let patch_fingerprint = fingerprint(patches);
+
     if destination.join("nuttx").is_dir() && destination.join("apps").is_dir() {
-        return Ok(());
+        let applied_fingerprint =
+            fs::read_to_string(destination.join(APPLIED_PATCHES_FILE)).unwrap_or_default();
+
+        if applied_fingerprint == patch_fingerprint {
+            return Ok(());
+        }
+
+        eprintln!("The NuttX patch set changed, extracting a clean tree");
     }
 
     let staging = Utf8PathBuf::from(format!("{destination}.partial"));
@@ -371,17 +405,41 @@ fn download_nuttx(version: &str, destination: &Utf8Path) -> Result<(), Box<dyn E
     fs::create_dir_all(&staging)?;
 
     for archive in ["apache-nuttx", "apache-nuttx-apps"] {
-        eprintln!("Downloading {archive}-{version}");
+        let archive_path = cached_archive(version, archive, archive_directory)?;
 
-        let body = fetch_archive(version, archive)?.into_body();
-        let mut tar_archive = tar::Archive::new(GzDecoder::new(body.into_reader()));
+        eprintln!("Extracting {archive}-{version}");
+        let mut tar_archive = tar::Archive::new(GzDecoder::new(fs::File::open(&archive_path)?));
         tar_archive.unpack(&staging)?;
     }
+
+    apply_patches(&staging, patches)?;
+    fs::write(staging.join(APPLIED_PATCHES_FILE), &patch_fingerprint)?;
 
     remove_dir_if_exists(destination)?;
     fs::rename(&staging, destination)?;
 
     Ok(())
+}
+
+fn cached_archive(
+    version: &str,
+    archive: &str,
+    archive_directory: &Utf8Path,
+) -> Result<Utf8PathBuf, Box<dyn Error>> {
+    let archive_path = archive_directory.join(format!("{archive}-{version}.tar.gz"));
+    if archive_path.is_file() {
+        return Ok(archive_path);
+    }
+
+    fs::create_dir_all(archive_directory)?;
+
+    eprintln!("Downloading {archive}-{version}");
+    let partial_path = Utf8PathBuf::from(format!("{archive_path}.partial"));
+    let mut body = fetch_archive(version, archive)?.into_body().into_reader();
+    io::copy(&mut body, &mut fs::File::create(&partial_path)?)?;
+    fs::rename(&partial_path, &archive_path)?;
+
+    Ok(archive_path)
 }
 
 fn fetch_archive(

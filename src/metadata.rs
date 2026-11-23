@@ -4,6 +4,8 @@ use camino::Utf8PathBuf;
 use cargo_metadata::Package;
 use serde::Deserialize;
 
+const DEFAULT_DIRECTORY: &str = "nuttx";
+
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Metadata {
@@ -11,8 +13,7 @@ pub struct Metadata {
     pub entrypoint_symbol: Option<String>,
     pub priority: u8,
     pub stack_size: u32,
-    pub config: Option<Utf8PathBuf>,
-    pub board_config_directory: Option<Utf8PathBuf>,
+    pub directory: Option<Utf8PathBuf>,
     pub nuttx_version: Option<String>,
     #[serde(default)]
     pub boards: BTreeMap<String, BoardSpecificMetadata>,
@@ -21,15 +22,12 @@ pub struct Metadata {
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct BoardSpecificMetadata {
-    pub target: String,
+    pub target: Option<String>,
     pub firmware_file: String,
     pub board_config: Option<String>,
     pub target_cpu: Option<String>,
     pub opt_level: Option<String>,
     pub runner: Option<Vec<String>>,
-    pub custom_board: Option<Utf8PathBuf>,
-    pub board_crate: Option<Utf8PathBuf>,
-    pub linker_script: Option<Utf8PathBuf>,
 }
 
 pub fn get_nuttx_metadata(package: &Package) -> Result<Metadata, Box<dyn Error>> {
@@ -51,31 +49,21 @@ pub fn get_nuttx_metadata(package: &Package) -> Result<Metadata, Box<dyn Error>>
         .manifest_path
         .parent()
         .ok_or("Package manifest has no parent directory")?;
-    metadata.config = metadata.config.map(|path| manifest_directory.join(path));
-    metadata.board_config_directory = metadata
-        .board_config_directory
-        .map(|path| manifest_directory.join(path));
 
-    for board in metadata.boards.values_mut() {
-        if board.target.ends_with(".json") {
-            board.target = manifest_directory.join(&board.target).into_string();
+    metadata.directory = match metadata.directory.take() {
+        Some(directory) => {
+            let directory = manifest_directory.join(directory);
+            if !directory.is_dir() {
+                return Err(format!("directory {directory} does not exist").into());
+            }
+
+            Some(directory)
         }
-
-        board.custom_board = board
-            .custom_board
-            .take()
-            .map(|path| manifest_directory.join(path));
-
-        board.board_crate = board
-            .board_crate
-            .take()
-            .map(|path| manifest_directory.join(path));
-
-        board.linker_script = board
-            .linker_script
-            .take()
-            .map(|path| manifest_directory.join(path));
-    }
+        None => {
+            let directory = manifest_directory.join(DEFAULT_DIRECTORY);
+            directory.is_dir().then_some(directory)
+        }
+    };
 
     Ok(metadata)
 }
